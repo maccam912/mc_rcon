@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 import '../models/player.dart';
 import '../providers/rcon_provider.dart';
 import '../theme/app_theme.dart';
+import 'inventory_screen.dart';
 
 class PlayerActionsScreen extends StatefulWidget {
   final Player player;
@@ -16,7 +17,10 @@ class PlayerActionsScreen extends StatefulWidget {
 class _PlayerActionsScreenState extends State<PlayerActionsScreen> {
   bool _isLoading = false;
 
-  Future<void> _runAction(Future<String> Function() action, String successMessage) async {
+  Future<void> _runAction(
+    Future<String> Function() action,
+    String successMessage,
+  ) async {
     setState(() => _isLoading = true);
 
     try {
@@ -49,9 +53,7 @@ class _PlayerActionsScreenState extends State<PlayerActionsScreen> {
     final playerName = widget.player.name;
 
     return Scaffold(
-      appBar: AppBar(
-        title: Text(playerName),
-      ),
+      appBar: AppBar(title: Text(playerName)),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : SingleChildScrollView(
@@ -158,7 +160,8 @@ class _PlayerActionsScreenState extends State<PlayerActionsScreen> {
                           label: 'Invincible',
                           color: AppTheme.diamond,
                           onTap: () => _runAction(
-                            () => provider.giveInvincibility(playerName, 1000000),
+                            () =>
+                                provider.giveInvincibility(playerName, 1000000),
                             'Gave invincibility',
                           ),
                         ),
@@ -227,16 +230,14 @@ class _PlayerActionsScreenState extends State<PlayerActionsScreen> {
                     children: [
                       Expanded(
                         child: _ActionCard(
-                          icon: Icons.delete_forever,
-                          label: 'Clear Inventory',
-                          color: Colors.orange,
-                          onTap: () => _confirmAction(
+                          icon: Icons.inventory_2,
+                          label: 'Manage Inventory',
+                          color: AppTheme.gold,
+                          onTap: () => Navigator.push(
                             context,
-                            'Clear Inventory',
-                            'This will delete all items from $playerName\'s inventory.',
-                            () => _runAction(
-                              () => provider.clearInventory(playerName),
-                              'Cleared inventory',
+                            MaterialPageRoute(
+                              builder: (context) =>
+                                  InventoryScreen(player: widget.player),
                             ),
                           ),
                         ),
@@ -334,9 +335,7 @@ class _PlayerActionsScreenState extends State<PlayerActionsScreen> {
             const SizedBox(height: 16),
             TextField(
               controller: reasonController,
-              decoration: const InputDecoration(
-                labelText: 'Reason',
-              ),
+              decoration: const InputDecoration(labelText: 'Reason'),
             ),
           ],
         ),
@@ -375,11 +374,7 @@ class _SectionHeader extends StatelessWidget {
   final IconData icon;
   final Color? color;
 
-  const _SectionHeader({
-    required this.title,
-    required this.icon,
-    this.color,
-  });
+  const _SectionHeader({required this.title, required this.icon, this.color});
 
   @override
   Widget build(BuildContext context) {
@@ -390,9 +385,9 @@ class _SectionHeader extends StatelessWidget {
         Text(
           title,
           style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                color: color ?? Colors.grey[400],
-                fontWeight: FontWeight.bold,
-              ),
+            color: color ?? Colors.grey[400],
+            fontWeight: FontWeight.bold,
+          ),
         ),
       ],
     );
@@ -470,7 +465,9 @@ class _TeleportSection extends StatelessWidget {
   Widget build(BuildContext context) {
     return Consumer<RconProvider>(
       builder: (context, provider, _) {
-        final otherPlayers = provider.players.where((p) => p.name != player.name).toList();
+        final otherPlayers = provider.players
+            .where((p) => p.name != player.name)
+            .toList();
 
         if (otherPlayers.isEmpty) {
           return Card(
@@ -575,10 +572,7 @@ class _GiveItemsSection extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              'Quick give (x1):',
-              style: TextStyle(color: Colors.grey[400]),
-            ),
+            Text('Quick give (x1):', style: TextStyle(color: Colors.grey[400])),
             const SizedBox(height: 12),
             Wrap(
               spacing: 8,
@@ -648,9 +642,7 @@ class _GiveItemsSection extends StatelessWidget {
             const SizedBox(height: 12),
             TextField(
               controller: amountController,
-              decoration: const InputDecoration(
-                labelText: 'Amount',
-              ),
+              decoration: const InputDecoration(labelText: 'Amount'),
               keyboardType: TextInputType.number,
             ),
           ],
@@ -690,10 +682,7 @@ class _XpSection extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              'Quick XP:',
-              style: TextStyle(color: Colors.grey[400]),
-            ),
+            Text('Quick XP:', style: TextStyle(color: Colors.grey[400])),
             const SizedBox(height: 12),
             Wrap(
               spacing: 8,
@@ -725,11 +714,15 @@ class _XpChip extends StatelessWidget {
       onPressed: () async {
         final provider = context.read<RconProvider>();
         try {
-          final response = await provider.sendCommand('xp add $playerName $levels levels');
+          final response = await provider.sendCommand(
+            'xp add $playerName $levels levels',
+          );
           if (context.mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text(response.isEmpty ? 'Added $levels XP levels' : response),
+                content: Text(
+                  response.isEmpty ? 'Added $levels XP levels' : response,
+                ),
                 backgroundColor: AppTheme.grassGreen,
               ),
             );

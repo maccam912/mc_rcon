@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:developer' as developer;
 import 'package:flutter/foundation.dart';
 import '../models/player.dart';
 import '../models/server_connection.dart';
@@ -133,7 +135,10 @@ class RconProvider extends ChangeNotifier {
       return players;
     }
 
-    final names = playerPart.split(',').map((s) => s.trim()).where((s) => s.isNotEmpty);
+    final names = playerPart
+        .split(',')
+        .map((s) => s.trim())
+        .where((s) => s.isNotEmpty);
     for (final name in names) {
       players.add(Player(name: name));
     }
@@ -152,7 +157,9 @@ class RconProvider extends ChangeNotifier {
 
   Future<String> giveInvincibility(String playerName, int seconds) async {
     // Resistance 255 makes the player invulnerable
-    return sendCommand('effect give $playerName minecraft:resistance $seconds 255');
+    return sendCommand(
+      'effect give $playerName minecraft:resistance $seconds 255',
+    );
   }
 
   Future<String> healPlayer(String playerName) async {
@@ -205,6 +212,63 @@ class RconProvider extends ChangeNotifier {
 
   Future<String> clearInventory(String playerName) async {
     return sendCommand('clear $playerName');
+  }
+
+  Future<List<Map<String, dynamic>>> getPlayerInventory(
+    String playerName,
+  ) async {
+    final response = await sendCommand('data get entity $playerName Inventory');
+    return _parseInventoryResponse(response);
+  }
+
+  List<Map<String, dynamic>> _parseInventoryResponse(String response) {
+    // Response format: "PlayerName has the following entity data: [{Slot: 0b, id: "minecraft:stone", count: 64b}, ...]"
+    try {
+      final startIndex = response.indexOf('[');
+      if (startIndex == -1) return [];
+
+      String snbt = response.substring(startIndex);
+
+      // Basic SNBT to JSON conversion for simple inventory items
+      // 1. Remove type suffixes: 0b, 10s, 100L, 1.0f, 1.0d
+      snbt = snbt.replaceAllMapped(RegExp(r'(\d+)[bsL]'), (m) => m.group(1)!);
+      snbt = snbt.replaceAllMapped(
+        RegExp(r'(\d+\.\d+)[fd]'),
+        (m) => m.group(1)!,
+      );
+
+      // 2. Ensure keys are quoted
+      snbt = snbt.replaceAllMapped(
+        RegExp(r'([{,]\s*)([a-zA-Z0-9_]+)\s*:'),
+        (m) => '${m.group(1)}"${m.group(2)}":',
+      );
+
+      final decoded = jsonDecode(snbt);
+      if (decoded is List) {
+        return List<Map<String, dynamic>>.from(decoded);
+      }
+    } catch (e) {
+      developer.log('Error parsing inventory response', error: e);
+    }
+    return [];
+  }
+
+  Future<String> removeItem(String playerName, int slot) async {
+    // In modern Minecraft, we can use /item replace
+    return sendCommand(
+      'item replace entity $playerName container.$slot with minecraft:air',
+    );
+  }
+
+  Future<String> setItem(
+    String playerName,
+    int slot,
+    String itemId,
+    int amount,
+  ) async {
+    return sendCommand(
+      'item replace entity $playerName container.$slot with $itemId $amount',
+    );
   }
 
   Future<String> giveXp(String playerName, int amount) async {
