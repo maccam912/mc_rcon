@@ -11,27 +11,31 @@
 .svn/
 .swiftpm/
 migrate_working_dir/
+*.env
+.env
+.env.*
 
-# IntelliJ related
+# IntelliJ / Android Studio related
 *.iml
 *.ipr
 *.iws
 .idea/
 
-# The .vscode folder contains launch configuration and tasks you configure in
-# VS Code which you may wish to be included in version control, so this line
-# is commented out by default.
-#.vscode/
+# VS Code related
+.vscode/
+*.code-workspace
 
 # Flutter/Dart/Pub related
 **/doc/api/
 **/ios/Flutter/.last_build_id
 .dart_tool/
+.flutter-plugins
 .flutter-plugins-dependencies
 .pub-cache/
 .pub/
 /build/
 /coverage/
+.packages
 
 # Symbolication related
 app.*.symbols
@@ -43,3 +47,25 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+/android/app/build/
+
+# iOS / macOS build artifacts
+*.a
+*.a[0-9]*
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xccheckout
+*.xcscmblueprint
+xcuserdata/
+DerivedData/
+*.moved-aside
+*.xcuserstate
+
+# Pods (handled by ios/macos gitignores normally, but safe here)
+/ios/Pods/
+/macos/Pods/
+
+# Crashlytics / Firebase
+crashlytics-build.properties

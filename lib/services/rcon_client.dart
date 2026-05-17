@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:developer' as developer;
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -22,7 +23,8 @@ class RconPacket {
 
   Uint8List toBytes() {
     final payloadBytes = utf8.encode(payload);
-    final length = 4 + 4 + payloadBytes.length + 2; // id + type + payload + 2 null bytes
+    final length =
+        4 + 4 + payloadBytes.length + 2; // id + type + payload + 2 null bytes
 
     final buffer = ByteData(4 + length);
     buffer.setInt32(0, length, Endian.little);
@@ -76,17 +78,26 @@ class RconClient {
       StreamController<bool>.broadcast();
   Stream<bool> get connectionStream => _connectionController.stream;
 
+  void _emitConnectionState(bool connected) {
+    if (!_connectionController.isClosed) {
+      _connectionController.add(connected);
+    }
+  }
+
   Future<bool> connect(String host, int port, String password) async {
     this.host = host;
     this.port = port;
 
+    developer.log('Connecting to $host:$port', name: 'RconClient');
+
     try {
-      _socket = await Socket.connect(host, port, timeout: const Duration(seconds: 10));
-      _socket!.listen(
-        _onData,
-        onError: _onError,
-        onDone: _onDone,
+      _socket = await Socket.connect(
+        host,
+        port,
+        timeout: const Duration(seconds: 10),
       );
+      developer.log('TCP socket connected to $host:$port', name: 'RconClient');
+      _socket!.listen(_onData, onError: _onError, onDone: _onDone);
 
       // Send auth packet
       final authId = _getNextId();
@@ -105,15 +116,29 @@ class RconClient {
       try {
         await completer.future.timeout(const Duration(seconds: 10));
         _isAuthenticated = true;
-        _connectionController.add(true);
+        developer.log(
+          'RCON authentication succeeded for $host:$port',
+          name: 'RconClient',
+        );
+        _emitConnectionState(true);
         return true;
       } catch (e) {
+        developer.log(
+          'RCON authentication failed or timed out for $host:$port',
+          name: 'RconClient',
+          error: e,
+        );
         await disconnect();
         return false;
       }
     } catch (e) {
-      _connectionController.add(false);
-      return false;
+      developer.log(
+        'TCP connection failed for $host:$port',
+        name: 'RconClient',
+        error: e,
+      );
+      _emitConnectionState(false);
+      rethrow;
     }
   }
 
@@ -122,11 +147,15 @@ class RconClient {
 
     // Process complete packets from buffer
     while (_buffer.length >= 4) {
-      final lengthData = ByteData.sublistView(Uint8List.fromList(_buffer.sublist(0, 4)));
+      final lengthData = ByteData.sublistView(
+        Uint8List.fromList(_buffer.sublist(0, 4)),
+      );
       final packetLength = lengthData.getInt32(0, Endian.little);
 
       if (_buffer.length >= packetLength + 4) {
-        final packetData = Uint8List.fromList(_buffer.sublist(0, packetLength + 4));
+        final packetData = Uint8List.fromList(
+          _buffer.sublist(0, packetLength + 4),
+        );
         _buffer.removeRange(0, packetLength + 4);
 
         final packet = RconPacket.fromBytes(packetData);
@@ -149,24 +178,26 @@ class RconClient {
     // Auth failed returns -1 id
     if (packet.id == -1) {
       _isAuthenticated = false;
-      _connectionController.add(false);
+      _emitConnectionState(false);
     }
 
     // Broadcast the response
-    if (packet.payload.isNotEmpty) {
+    if (packet.payload.isNotEmpty && !_responseController.isClosed) {
       _responseController.add(packet.payload);
     }
   }
 
   void _onError(Object error) {
+    developer.log('Socket error', name: 'RconClient', error: error);
     _isAuthenticated = false;
-    _connectionController.add(false);
+    _emitConnectionState(false);
     _pendingRequests.clear();
   }
 
   void _onDone() {
+    developer.log('Socket closed', name: 'RconClient');
     _isAuthenticated = false;
-    _connectionController.add(false);
+    _emitConnectionState(false);
     _pendingRequests.clear();
     _socket = null;
   }
@@ -177,7 +208,7 @@ class RconClient {
     _socket = null;
     _buffer.clear();
     _pendingRequests.clear();
-    _connectionController.add(false);
+    _emitConnectionState(false);
   }
 
   Future<String> sendCommand(String command) async {
@@ -214,7 +245,11 @@ class RconClient {
   }
 
   void dispose() {
-    disconnect();
+    _isAuthenticated = false;
+    _socket?.destroy();
+    _socket = null;
+    _buffer.clear();
+    _pendingRequests.clear();
     _responseController.close();
     _connectionController.close();
   }
