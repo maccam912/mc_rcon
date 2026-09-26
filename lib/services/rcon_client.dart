@@ -15,6 +15,9 @@ enum RconPacketType {
 }
 
 class RconPacket {
+  // Bound allocation even when a broken or unrelated service answers this port.
+  static const maxLength = 4 * 1024 * 1024;
+
   final int id;
   final int type;
   final String payload;
@@ -22,53 +25,92 @@ class RconPacket {
   RconPacket({required this.id, required this.type, required this.payload});
 
   Uint8List toBytes() {
+    if (payload.contains('\u0000')) {
+      throw const FormatException('RCON payloads cannot contain null bytes');
+    }
     final payloadBytes = utf8.encode(payload);
-    final length =
-        4 + 4 + payloadBytes.length + 2; // id + type + payload + 2 null bytes
-
+    final length = 10 + payloadBytes.length;
+    if (length > maxLength) {
+      throw const FormatException('RCON packet is too large');
+    }
     final buffer = ByteData(4 + length);
     buffer.setInt32(0, length, Endian.little);
     buffer.setInt32(4, id, Endian.little);
     buffer.setInt32(8, type, Endian.little);
-
     final bytes = buffer.buffer.asUint8List();
     bytes.setRange(12, 12 + payloadBytes.length, payloadBytes);
-    bytes[12 + payloadBytes.length] = 0;
-    bytes[12 + payloadBytes.length + 1] = 0;
-
     return bytes;
   }
 
   static RconPacket? fromBytes(Uint8List data) {
-    if (data.length < 14) return null;
-
+    if (data.length < 4) return null;
     final buffer = ByteData.sublistView(data);
-    final id = buffer.getInt32(4, Endian.little);
-    final type = buffer.getInt32(8, Endian.little);
-
-    // Find the null terminator for the payload
-    int payloadEnd = 12;
-    while (payloadEnd < data.length - 1 && data[payloadEnd] != 0) {
-      payloadEnd++;
+    final length = buffer.getInt32(0, Endian.little);
+    if (length < 10 || length > maxLength) {
+      throw FormatException('Invalid RCON packet length: $length');
     }
-
-    final payload = utf8.decode(data.sublist(12, payloadEnd));
-
-    return RconPacket(id: id, type: type, payload: payload);
+    if (data.length < length + 4) return null;
+    if (data.length != length + 4 ||
+        data[data.length - 2] != 0 ||
+        data[data.length - 1] != 0) {
+      throw const FormatException('Invalid RCON packet framing');
+    }
+    final payload = data.sublist(12, data.length - 2);
+    if (payload.contains(0)) {
+      throw const FormatException('Invalid RCON payload terminator');
+    }
+    return RconPacket(
+      id: buffer.getInt32(4, Endian.little),
+      type: buffer.getInt32(8, Endian.little),
+      payload: utf8.decode(payload),
+    );
   }
 }
 
+class RconAuthenticationException implements Exception {
+  const RconAuthenticationException();
+
+  @override
+  String toString() => 'RCON authentication failed. Check the server password.';
+}
+
+class _PendingCommand {
+  _PendingCommand(this.id, this.endId);
+
+  final int id;
+  final int endId;
+  final completer = Completer<String>();
+  final response = StringBuffer();
+  bool probeSent = false;
+}
+
 class RconClient {
+  RconClient({
+    this.connectTimeout = const Duration(seconds: 10),
+    this.authTimeout = const Duration(seconds: 10),
+    this.commandTimeout = const Duration(seconds: 30),
+  });
+
+  final Duration connectTimeout;
+  final Duration authTimeout;
+  final Duration commandTimeout;
   Socket? _socket;
   int _requestId = 0;
+  int _generation = 0;
   bool _isAuthenticated = false;
-  final Map<int, Completer<String>> _pendingRequests = {};
+  bool _disposed = false;
+  Object? _lastError;
+  Completer<void>? _authentication;
+  int? _authId;
+  _PendingCommand? _pendingCommand;
+  Future<void> _commandQueue = Future<void>.value();
   final List<int> _buffer = [];
 
   String? host;
   int? port;
 
   bool get isConnected => _socket != null && _isAuthenticated;
+  Object? get lastError => _lastError;
 
   final StreamController<String> _responseController =
       StreamController<String>.broadcast();
@@ -85,171 +127,232 @@ class RconClient {
   }
 
   Future<bool> connect(String host, int port, String password) async {
+    if (_disposed) throw StateError('RCON client has been disposed');
+    _closeConnection(const SocketException('RCON connection replaced'));
+    final generation = _generation;
     this.host = host;
     this.port = port;
-
+    _lastError = null;
     developer.log('Connecting to $host:$port', name: 'RconClient');
 
+    final Socket socket;
     try {
-      _socket = await Socket.connect(
-        host,
-        port,
-        timeout: const Duration(seconds: 10),
-      );
-      developer.log('TCP socket connected to $host:$port', name: 'RconClient');
-      _socket!.listen(_onData, onError: _onError, onDone: _onDone);
-
-      // Send auth packet
-      final authId = _getNextId();
-      final authPacket = RconPacket(
-        id: authId,
-        type: RconPacketType.auth.value,
-        payload: password,
-      );
-
-      final completer = Completer<String>();
-      _pendingRequests[authId] = completer;
-
-      _socket!.add(authPacket.toBytes());
-
-      // Wait for auth response with timeout
-      try {
-        await completer.future.timeout(const Duration(seconds: 10));
-        _isAuthenticated = true;
-        developer.log(
-          'RCON authentication succeeded for $host:$port',
-          name: 'RconClient',
-        );
-        _emitConnectionState(true);
-        return true;
-      } catch (e) {
-        developer.log(
-          'RCON authentication failed or timed out for $host:$port',
-          name: 'RconClient',
-          error: e,
-        );
-        await disconnect();
-        return false;
-      }
-    } catch (e) {
-      developer.log(
-        'TCP connection failed for $host:$port',
-        name: 'RconClient',
-        error: e,
-      );
+      socket = await Socket.connect(host, port, timeout: connectTimeout);
+    } catch (error) {
+      if (generation != _generation) return false;
+      _lastError = error;
       _emitConnectionState(false);
       rethrow;
+    }
+    // A cancelled/replaced connection may still finish opening its TCP socket.
+    if (_disposed || generation != _generation) {
+      socket.destroy();
+      return false;
+    }
+    _socket = socket;
+    socket.setOption(SocketOption.tcpNoDelay, true);
+    socket.listen(
+      (data) {
+        if (generation == _generation) _onData(data);
+      },
+      onError: (Object error) {
+        if (generation == _generation) _closeConnection(error);
+      },
+      onDone: () {
+        if (generation == _generation) {
+          _closeConnection(
+            const SocketException('RCON server closed the connection'),
+          );
+        }
+      },
+    );
+
+    final authentication = Completer<void>();
+    _authentication = authentication;
+    _authId = _getNextId();
+    try {
+      try {
+        socket.add(
+          RconPacket(
+            id: _authId!,
+            type: RconPacketType.auth.value,
+            payload: password,
+          ).toBytes(),
+        );
+      } catch (error) {
+        _closeConnection(error);
+      }
+      // Await even a synchronous write failure so its completer error always
+      // has a listener, rather than escaping as an unhandled asynchronous error.
+      await authentication.future.timeout(authTimeout);
+      if (generation != _generation || _disposed) return false;
+      _authentication = null;
+      _authId = null;
+      _isAuthenticated = true;
+      _lastError = null;
+      _emitConnectionState(true);
+      return true;
+    } catch (error) {
+      if (generation == _generation) _closeConnection(error);
+      return false;
     }
   }
 
   void _onData(Uint8List data) {
     _buffer.addAll(data);
-
-    // Process complete packets from buffer
-    while (_buffer.length >= 4) {
-      final lengthData = ByteData.sublistView(
-        Uint8List.fromList(_buffer.sublist(0, 4)),
-      );
-      final packetLength = lengthData.getInt32(0, Endian.little);
-
-      if (_buffer.length >= packetLength + 4) {
+    try {
+      while (_buffer.length >= 4) {
+        final packetLength = ByteData.sublistView(
+          Uint8List.fromList(_buffer.sublist(0, 4)),
+        ).getInt32(0, Endian.little);
+        if (packetLength < 10 || packetLength > RconPacket.maxLength) {
+          throw FormatException('Invalid RCON packet length: $packetLength');
+        }
+        if (_buffer.length < packetLength + 4) return;
         final packetData = Uint8List.fromList(
           _buffer.sublist(0, packetLength + 4),
         );
         _buffer.removeRange(0, packetLength + 4);
-
-        final packet = RconPacket.fromBytes(packetData);
-        if (packet != null) {
-          _handlePacket(packet);
-        }
-      } else {
-        break;
+        _handlePacket(RconPacket.fromBytes(packetData)!);
+        if (_socket == null) return;
       }
+    } catch (error) {
+      _closeConnection(error);
     }
   }
 
   void _handlePacket(RconPacket packet) {
-    // Check if this is a response to a pending request
-    if (_pendingRequests.containsKey(packet.id)) {
-      _pendingRequests[packet.id]!.complete(packet.payload);
-      _pendingRequests.remove(packet.id);
+    if (packet.id == -1 && packet.type == RconPacketType.authResponse.value) {
+      _closeConnection(const RconAuthenticationException());
+      return;
     }
+    final authentication = _authentication;
+    if (authentication != null) {
+      // Some servers send an empty response packet before the real auth reply.
+      // A matching ID alone does not establish authentication.
+      if (packet.id == _authId &&
+          packet.type == RconPacketType.authResponse.value &&
+          !authentication.isCompleted) {
+        authentication.complete();
+      }
+      return;
+    }
+    if (packet.type != RconPacketType.response.value) {
+      throw const FormatException('Unexpected RCON response packet type');
+    }
+    final pending = _pendingCommand;
+    if (pending == null) return;
+    if (packet.id == pending.id) {
+      pending.response.write(packet.payload);
+      if (!pending.probeSent) {
+        pending.probeSent = true;
+        // Minecraft processes commands in order. The reply to an empty command
+        // marks the end of this response, including every split response packet.
+        // Send it only after the first reply: some Minecraft servers cannot read
+        // multiple request packets coalesced into the same socket read.
+        _socket!.add(
+          RconPacket(
+            id: pending.endId,
+            type: RconPacketType.command.value,
+            payload: '',
+          ).toBytes(),
+        );
+      }
+    } else if (packet.id == pending.endId && pending.probeSent) {
+      _pendingCommand = null;
+      final response = pending.response.toString();
+      pending.completer.complete(response);
+      if (response.isNotEmpty && !_responseController.isClosed) {
+        _responseController.add(response);
+      }
+    }
+  }
 
-    // Auth failed returns -1 id
-    if (packet.id == -1) {
-      _isAuthenticated = false;
+  void _closeConnection(Object error) {
+    final wasOpen = _socket != null || _isAuthenticated;
+    _generation++;
+    _isAuthenticated = false;
+    _lastError = error;
+    final socket = _socket;
+    _socket = null;
+    socket?.destroy();
+    _buffer.clear();
+    final authentication = _authentication;
+    _authentication = null;
+    _authId = null;
+    if (authentication != null && !authentication.isCompleted) {
+      authentication.completeError(error);
+    }
+    final pending = _pendingCommand;
+    _pendingCommand = null;
+    if (pending != null && !pending.completer.isCompleted) {
+      pending.completer.completeError(error);
+    }
+    if (wasOpen) {
+      developer.log('RCON connection closed', name: 'RconClient', error: error);
       _emitConnectionState(false);
     }
-
-    // Broadcast the response
-    if (packet.payload.isNotEmpty && !_responseController.isClosed) {
-      _responseController.add(packet.payload);
-    }
-  }
-
-  void _onError(Object error) {
-    developer.log('Socket error', name: 'RconClient', error: error);
-    _isAuthenticated = false;
-    _emitConnectionState(false);
-    _pendingRequests.clear();
-  }
-
-  void _onDone() {
-    developer.log('Socket closed', name: 'RconClient');
-    _isAuthenticated = false;
-    _emitConnectionState(false);
-    _pendingRequests.clear();
-    _socket = null;
   }
 
   Future<void> disconnect() async {
-    _isAuthenticated = false;
-    await _socket?.close();
-    _socket = null;
-    _buffer.clear();
-    _pendingRequests.clear();
-    _emitConnectionState(false);
+    _closeConnection(const SocketException('RCON connection disconnected'));
   }
 
-  Future<String> sendCommand(String command) async {
+  Future<String> sendCommand(String command) {
     if (!isConnected) {
-      throw Exception('Not connected to RCON server');
+      return Future<String>.error(
+        const SocketException('Not connected to RCON server'),
+      );
     }
+    final generation = _generation;
+    // A queued command belongs to this connection. Never replay it after a
+    // reconnect: an interrupted command may already have changed the server.
+    final result = _commandQueue.then((_) => _sendCommand(command, generation));
+    _commandQueue = result.then<void>(
+      (_) {},
+      onError: (Object error, StackTrace stack) {},
+    );
+    return result;
+  }
 
-    final requestId = _getNextId();
-    final packet = RconPacket(
-      id: requestId,
+  Future<String> _sendCommand(String command, int generation) async {
+    if (!isConnected || generation != _generation) {
+      throw const SocketException(
+        'RCON disconnected before the command was sent',
+      );
+    }
+    final pending = _PendingCommand(_getNextId(), _getNextId());
+    // Validate the payload before registering a request that needs completion.
+    final bytes = RconPacket(
+      id: pending.id,
       type: RconPacketType.command.value,
       payload: command,
-    );
-
-    final completer = Completer<String>();
-    _pendingRequests[requestId] = completer;
-
-    _socket!.add(packet.toBytes());
-
+    ).toBytes();
+    _pendingCommand = pending;
     try {
-      return await completer.future.timeout(const Duration(seconds: 30));
-    } catch (e) {
-      _pendingRequests.remove(requestId);
+      try {
+        _socket!.add(bytes);
+      } catch (error) {
+        _closeConnection(error);
+      }
+      return await pending.completer.future.timeout(commandTimeout);
+    } catch (error) {
+      // A timeout means the connection is no longer trustworthy. Invalidate it
+      // and all queued commands so the UI can reconnect and report uncertainty.
+      if (generation == _generation) _closeConnection(error);
       rethrow;
     }
   }
 
   int _getNextId() {
-    _requestId++;
-    if (_requestId > 2147483647) {
-      _requestId = 1;
-    }
+    _requestId = _requestId >= 2147483647 ? 1 : _requestId + 1;
     return _requestId;
   }
 
   void dispose() {
-    _isAuthenticated = false;
-    _socket?.destroy();
-    _socket = null;
-    _buffer.clear();
-    _pendingRequests.clear();
+    if (_disposed) return;
+    _disposed = true;
+    _closeConnection(const SocketException('RCON client disposed'));
     _responseController.close();
     _connectionController.close();
   }

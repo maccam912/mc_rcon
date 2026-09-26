@@ -1,11 +1,11 @@
 class Player {
   final String name;
   final String? uuid;
+  final String? botOwner;
 
-  Player({
-    required this.name,
-    this.uuid,
-  });
+  bool get isBot => botOwner != null;
+
+  Player({required this.name, this.uuid, this.botOwner});
 
   @override
   bool operator ==(Object other) {

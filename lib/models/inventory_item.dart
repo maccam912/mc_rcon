@@ -14,10 +14,19 @@ class InventoryItem {
   factory InventoryItem.fromNbt(Map<String, dynamic> nbt) {
     return InventoryItem(
       id: nbt['id'] ?? 'minecraft:air',
-      count: (nbt['count'] ?? 1).toInt(),
-      slot: (nbt['Slot'] ?? 0).toInt(),
-      tag: nbt['tag']?.toString(),
+      count: _integer(nbt['count'] ?? nbt['Count'], 1),
+      slot: _integer(nbt['Slot'] ?? nbt['slot'], -1),
+      tag: (nbt['components'] ?? nbt['tag'])?.toString(),
     );
+  }
+
+  static int _integer(dynamic value, int fallback) {
+    if (value is num) return value.toInt();
+    if (value is String) {
+      return int.tryParse(value.replaceFirst(RegExp(r'[bBsSlL]$'), '')) ??
+          fallback;
+    }
+    return fallback;
   }
 
   String get displayName {

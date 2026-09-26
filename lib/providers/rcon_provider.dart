@@ -1,48 +1,107 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:developer' as developer;
-import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 import '../models/player.dart';
+import '../models/player_admin_status.dart';
 import '../models/server_connection.dart';
+import '../services/inventory_parser.dart';
 import '../services/rcon_client.dart';
+import '../services/player_timer_service.dart';
 import '../services/storage_service.dart';
 
-class RconProvider extends ChangeNotifier {
-  final RconClient _client = RconClient();
-  final StorageService _storage = StorageService();
+class RconCommandException implements Exception {
+  final String message;
+  const RconCommandException(this.message);
+  @override
+  String toString() => message;
+}
+
+class RconProvider extends ChangeNotifier with WidgetsBindingObserver {
+  final RconClient _client;
+  final StorageService _storage;
+  final Duration pollInterval;
+  late final StreamSubscription<bool> _connectionSubscription;
+  Timer? _monitor;
+  Future<bool>? _connecting;
+  Future<void>? _refreshing;
+  int _generation = 0;
+  bool _disposed = false;
+  DateTime? _lastHealthy;
 
   List<ServerConnection> _savedConnections = [];
   ServerConnection? _currentConnection;
   List<Player> _players = [];
-  List<String> _commandHistory = [];
+  final List<String> _commandHistory = [];
   bool _isConnecting = false;
   String? _lastError;
+  PlayerTimerService? _timers;
+  String? _timerError;
+  final StreamController<String> _noticeController =
+      StreamController<String>.broadcast();
 
-  // Getters
-  List<ServerConnection> get savedConnections => _savedConnections;
+  List<ServerConnection> get savedConnections =>
+      List.unmodifiable(_savedConnections);
   ServerConnection? get currentConnection => _currentConnection;
-  List<Player> get players => _players;
-  List<String> get commandHistory => _commandHistory;
+  List<Player> get players => List.unmodifiable(_players);
+  List<String> get commandHistory => List.unmodifiable(_commandHistory);
   bool get isConnected => _client.isConnected;
   bool get isConnecting => _isConnecting;
   String? get lastError => _lastError;
+  List<PlayerTimerStatus> get timerStatuses => _timers?.status ?? [];
+  PlayerTimerStatus? timerStatusFor(String name) {
+    for (final status in timerStatuses) {
+      if (status.name.toLowerCase() == name.toLowerCase()) return status;
+    }
+    return null;
+  }
+
+  String? get timerError => _timerError;
+  bool get supportsPlayerTimers => _timers != null;
+  Stream<String> get notices => _noticeController.stream;
   Stream<String> get responseStream => _client.responseStream;
   Stream<bool> get connectionStream => _client.connectionStream;
 
-  RconProvider() {
-    _init();
-    _client.connectionStream.listen((connected) {
-      notifyListeners();
+  RconProvider({
+    RconClient? client,
+    StorageService? storage,
+    this.pollInterval = const Duration(seconds: 10),
+  }) : _client = client ?? RconClient(),
+       _storage = storage ?? StorageService() {
+    WidgetsBinding.instance.addObserver(this);
+    _connectionSubscription = _client.connectionStream.listen((connected) {
+      if (!connected && _currentConnection != null) {
+        _lastHealthy = null;
+        _timers?.suspend();
+        _lastError = 'Connection lost. Reconnecting automatically…';
+      }
+      _notify();
     });
+    unawaited(loadSavedConnections());
   }
 
-  Future<void> _init() async {
-    await loadSavedConnections();
+  void _notify() {
+    if (!_disposed) notifyListeners();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      _timers?.suspend();
+    }
+    if (state == AppLifecycleState.resumed && _currentConnection != null) {
+      _timers?.suspend();
+      _lastHealthy = null;
+      unawaited(refreshPlayers());
+    }
   }
 
   Future<void> loadSavedConnections() async {
-    _savedConnections = await _storage.getConnections();
-    notifyListeners();
+    try {
+      _savedConnections = await _storage.getConnections();
+    } catch (error) {
+      _lastError = 'Could not load saved servers: $error';
+    }
+    _notify();
   }
 
   Future<void> saveConnection(ServerConnection connection) async {
@@ -56,231 +115,446 @@ class RconProvider extends ChangeNotifier {
   }
 
   Future<bool> connect(ServerConnection connection) async {
-    _isConnecting = true;
-    _lastError = null;
-    notifyListeners();
-
-    try {
-      final success = await _client.connect(
-        connection.host,
-        connection.port,
-        connection.password,
-      );
-
-      if (success) {
-        _currentConnection = connection;
+    final disconnecting = disconnect();
+    final generation = _generation;
+    await disconnecting;
+    if (_disposed || generation != _generation) return false;
+    _currentConnection = connection;
+    final success = await _ensureConnected();
+    if (_disposed || generation != _generation) return false;
+    if (success) {
+      try {
         await _storage.setLastConnectionId(connection.id);
-        await refreshPlayers();
-      } else {
-        _lastError = 'Failed to authenticate. Check your password.';
+      } catch (error) {
+        if (!_disposed && generation == _generation) {
+          _lastError = 'Connected, but could not save the last server: $error';
+        }
       }
+      if (_disposed || generation != _generation) return false;
+      await _loadTimers(connection, generation);
+      if (_disposed || generation != _generation) return false;
+      _monitor = Timer.periodic(
+        pollInterval,
+        (_) => unawaited(refreshPlayers()),
+      );
+      await refreshPlayers();
+    } else {
+      _currentConnection = null;
+    }
+    if (_disposed || generation != _generation) return false;
+    _notify();
+    // Once authenticated, show the home screen even if its first refresh lost
+    // the connection. The monitor and visible reconnect banner handle recovery.
+    return success;
+  }
 
-      _isConnecting = false;
-      notifyListeners();
-      return success;
-    } catch (e) {
-      _lastError = 'Connection failed: ${e.toString()}';
-      _isConnecting = false;
-      notifyListeners();
-      return false;
+  Future<void> _loadTimers(ServerConnection connection, int generation) async {
+    final timers = PlayerTimerService(
+      command: (command) {
+        _checkConnectionGeneration(generation);
+        return sendCommand(command);
+      },
+      onNotice: (message) {
+        if (!_disposed && generation == _generation) {
+          _noticeController.add(message);
+        }
+      },
+      onError: (error) {
+        if (!_disposed && generation == _generation) {
+          _timerError = error;
+          _notify();
+        }
+      },
+    );
+    try {
+      await timers.load(
+        '${connection.host.trim().toLowerCase()}:${connection.port}',
+      );
+      if (_disposed || generation != _generation) return;
+      _timers = timers;
+      _timerError = null;
+    } catch (error) {
+      if (generation == _generation) {
+        _timerError = 'Could not load saved timers: $error';
+      }
+    }
+  }
+
+  Future<bool> _ensureConnected() async {
+    if (_connecting != null) return _connecting!;
+    if (isConnected) return true;
+    final connection = _currentConnection;
+    if (connection == null || _disposed) return false;
+    final generation = _generation;
+    _isConnecting = true;
+    _notify();
+    final attempt = () async {
+      try {
+        final success = await _client.connect(
+          connection.host,
+          connection.port,
+          connection.password,
+        );
+        if (_disposed || generation != _generation) return false;
+        if (!success) {
+          _lastError =
+              '${_client.lastError ?? 'Could not connect to the RCON server.'}';
+          return false;
+        }
+        _lastError = null;
+        _lastHealthy = DateTime.now();
+        return true;
+      } catch (error) {
+        if (generation == _generation) _lastError = 'Connection failed: $error';
+        return false;
+      } finally {
+        if (generation == _generation) {
+          _isConnecting = false;
+          _notify();
+        }
+      }
+    }();
+    _connecting = attempt;
+    try {
+      return await attempt;
+    } finally {
+      if (identical(_connecting, attempt)) _connecting = null;
     }
   }
 
   Future<void> disconnect() async {
-    await _client.disconnect();
+    _generation++;
+    _monitor?.cancel();
+    _monitor = null;
     _currentConnection = null;
     _players = [];
-    notifyListeners();
+    _timers?.suspend();
+    _timers = null;
+    _timerError = null;
+    _lastHealthy = null;
+    _lastError = null;
+    _isConnecting = false;
+    _connecting = null;
+    _refreshing = null;
+    await _client.disconnect();
+    _notify();
+  }
+
+  /// Verify idle sockets before a mutation; only the harmless probe is retried.
+  Future<void> _readyForCommand() async {
+    final generation = _generation;
+    if (!await _ensureConnected()) {
+      throw RconCommandException(_lastError ?? 'Not connected to a server.');
+    }
+    _checkConnectionGeneration(generation);
+    if (_lastHealthy == null ||
+        DateTime.now().difference(_lastHealthy!) > const Duration(seconds: 5)) {
+      try {
+        await _client.sendCommand('list');
+        _checkConnectionGeneration(generation);
+        _lastHealthy = DateTime.now();
+      } catch (_) {
+        _checkConnectionGeneration(generation);
+        await _client.disconnect();
+        _checkConnectionGeneration(generation);
+        if (!await _ensureConnected()) {
+          throw RconCommandException(_lastError ?? 'Unable to reconnect.');
+        }
+        _checkConnectionGeneration(generation);
+      }
+    }
+  }
+
+  void _checkConnectionGeneration(int generation) {
+    if (_disposed || generation != _generation) {
+      throw const RconCommandException(
+        'The server connection changed. Try again.',
+      );
+    }
   }
 
   Future<String> sendCommand(String command) async {
-    if (!isConnected) {
-      throw Exception('Not connected');
+    command = command.trim();
+    if (command.startsWith('/')) command = command.substring(1);
+    if (command.isEmpty || command.contains(RegExp(r'[\r\n\x00]'))) {
+      throw const RconCommandException('Enter one non-empty command.');
     }
-
+    final generation = _generation;
+    await _readyForCommand();
+    if (_disposed || generation != _generation) {
+      throw const RconCommandException(
+        'The server connection changed. Try again.',
+      );
+    }
     _commandHistory.insert(0, command);
-    if (_commandHistory.length > 100) {
-      _commandHistory = _commandHistory.sublist(0, 100);
+    if (_commandHistory.length > 100) _commandHistory.removeLast();
+    try {
+      final response = await _client.sendCommand(command);
+      _checkConnectionGeneration(generation);
+      _lastHealthy = DateTime.now();
+      _throwIfCommandFailed(response);
+      _lastError = null;
+      _notify();
+      return response;
+    } catch (error) {
+      if (_disposed || generation != _generation) {
+        throw const RconCommandException(
+          'The server connection changed before confirmation. Check the result before retrying.',
+        );
+      }
+      _lastError = isConnected
+          ? '$error'
+          : 'Connection lost before confirmation. Check the result before retrying. Reconnecting automatically…';
+      _notify();
+      throw RconCommandException(_lastError!);
     }
+  }
 
-    final response = await _client.sendCommand(command);
-    notifyListeners();
-    return response;
+  static void _throwIfCommandFailed(String response) {
+    final plain = response.replaceAll(RegExp(r'§.'), '').trim();
+    if (RegExp(
+          r'^(Unknown or incomplete command|Unknown command|Incorrect argument|Invalid |Expected |No player was found|No entity was found|No players were found|No entities were found|Only players|Player not found|That player does not exist|You do not have permission|You don.t have permission|Failed to |Error:|Cannot |Can.t |Not a valid|Unable to |Nothing changed|No items were found|No matching elements|Found no elements)',
+          caseSensitive: false,
+        ).hasMatch(plain) ||
+        plain.contains('<--[HERE]')) {
+      throw RconCommandException(plain);
+    }
   }
 
   Future<void> refreshPlayers() async {
-    if (!isConnected) return;
-
+    if (_currentConnection == null || _disposed) return;
+    if (_refreshing != null) return _refreshing!;
+    final refresh = _refreshPlayers();
+    _refreshing = refresh;
     try {
-      final response = await _client.sendCommand('list');
-      _players = _parsePlayerList(response);
-      notifyListeners();
-    } catch (e) {
-      // Silent fail for player refresh
+      await refresh;
+    } finally {
+      if (identical(_refreshing, refresh)) _refreshing = null;
     }
   }
 
-  List<Player> _parsePlayerList(String response) {
-    // Response format: "There are X of a max of Y players online: player1, player2, player3"
-    // Or: "There are 0 of a max of Y players online:"
-    final players = <Player>[];
-
-    final colonIndex = response.indexOf(':');
-    if (colonIndex == -1 || colonIndex == response.length - 1) {
-      return players;
+  Future<void> _refreshPlayers() async {
+    final generation = _generation;
+    try {
+      if (!await _ensureConnected()) return;
+      if (_disposed || generation != _generation) return;
+      final response = await _client.sendCommand('list');
+      if (_disposed || generation != _generation) return;
+      _throwIfCommandFailed(response);
+      _players = parsePlayerList(response);
+      _lastHealthy = DateTime.now();
+      _lastError = null;
+      if (_timers == null) {
+        await _loadTimers(_currentConnection!, generation);
+      }
+      if (_disposed || generation != _generation) return;
+      if (_timers != null) _timerError = null;
+      await _timers?.observePlayers(
+        _players.where((p) => !p.isBot).map((p) => p.name).toList(),
+      );
+    } catch (error) {
+      if (generation == _generation) {
+        _timers?.suspend();
+        _lastError =
+            'Could not refresh players or timers: $error. Retrying automatically…';
+      }
+    } finally {
+      if (generation == _generation) _notify();
     }
+  }
 
-    final playerPart = response.substring(colonIndex + 1).trim();
-    if (playerPart.isEmpty) {
-      return players;
-    }
-
-    final names = playerPart
+  static List<Player> parsePlayerList(String response) {
+    final plain = response.replaceAll(RegExp(r'§.'), '').trim();
+    final colon = plain.indexOf(':');
+    if (colon < 0) throw FormatException('Unrecognized player list: $plain');
+    return plain
+        .substring(colon + 1)
         .split(',')
         .map((s) => s.trim())
-        .where((s) => s.isNotEmpty);
-    for (final name in names) {
-      players.add(Player(name: name));
+        .where((s) => s.isNotEmpty)
+        .map((name) {
+          final bot = RegExp(r'^\[Bot\]([A-Za-z0-9_]{1,16})$').firstMatch(name);
+          return Player(name: name, botOwner: bot?.group(1));
+        })
+        .toList();
+  }
+
+  String _playerArgument(String name) {
+    if (!RegExp(r'^(?:\[Bot\])?[A-Za-z0-9_]{1,16}$').hasMatch(name)) {
+      throw const RconCommandException('Invalid player name.');
     }
-
-    return players;
+    return name.startsWith('[Bot]') ? '@a[name="$name",limit=1]' : name;
   }
 
-  // Quick commands for dad admin
-  Future<String> setGameMode(String playerName, GameMode mode) async {
-    return sendCommand('gamemode ${mode.command} $playerName');
+  Future<String> _timerAction(
+    Future<String> Function(PlayerTimerService) action,
+  ) async {
+    final timers = _timers;
+    if (timers == null) {
+      throw RconCommandException(
+        _timerError ?? 'Player timers are still loading.',
+      );
+    }
+    final generation = _generation;
+    try {
+      final message = await action(timers);
+      _checkConnectionGeneration(generation);
+      _timerError = null;
+      _notify();
+      await refreshPlayers();
+      return message;
+    } catch (error) {
+      if (!_disposed && generation == _generation) {
+        _timerError = '$error';
+        _notify();
+      }
+      rethrow;
+    }
   }
 
-  Future<String> teleportPlayerTo(String from, String to) async {
-    return sendCommand('tp $from $to');
+  Future<String> setPlayPolicy(
+    String player,
+    int playMinutes,
+    int breakMinutes,
+  ) => _timerAction(
+    (timers) => timers.setPolicy(player, playMinutes, breakMinutes),
+  );
+
+  Future<String> disablePlayPolicy(String player) =>
+      _timerAction((timers) => timers.disablePolicy(player));
+
+  Future<String> releasePlayer(String player) =>
+      _timerAction((timers) => timers.release(player));
+
+  Future<String> setGameMode(String playerName, GameMode mode) =>
+      sendCommand('gamemode ${mode.command} ${_playerArgument(playerName)}');
+  Future<String> teleportPlayerTo(String from, String to) =>
+      sendCommand('tp ${_playerArgument(from)} ${_playerArgument(to)}');
+  Future<String> giveInvincibility(
+    String playerName,
+    int seconds,
+  ) => sendCommand(
+    'effect give ${_playerArgument(playerName)} minecraft:resistance $seconds 255',
+  );
+  Future<String> healPlayer(String playerName) => sendCommand(
+    'effect give ${_playerArgument(playerName)} minecraft:instant_health 1 10',
+  );
+  Future<String> feedPlayer(String playerName) => sendCommand(
+    'effect give ${_playerArgument(playerName)} minecraft:saturation 1 20',
+  );
+  Future<String> clearEffects(String playerName) =>
+      sendCommand('effect clear ${_playerArgument(playerName)}');
+  Future<String> setTime(String time) => sendCommand('time set $time');
+  Future<String> setWeather(String weather) => sendCommand('weather $weather');
+
+  Future<String> giveItem(String playerName, String item, int amount) {
+    _validateItem(item, amount);
+    return sendCommand('give ${_playerArgument(playerName)} $item $amount');
   }
 
-  Future<String> giveInvincibility(String playerName, int seconds) async {
-    // Resistance 255 makes the player invulnerable
-    return sendCommand(
-      'effect give $playerName minecraft:resistance $seconds 255',
-    );
+  Future<String> kickPlayer(
+    String playerName,
+    String reason, {
+    int lockoutMinutes = 0,
+  }) async {
+    _playerArgument(playerName);
+    final bot = RegExp(r'^\[Bot\]([A-Za-z0-9_]{1,16})$').firstMatch(playerName);
+    if (bot != null) {
+      await sendCommand('assistant ${bot.group(1)} dismiss');
+      // Older mod sends feedback to the owner, so confirm the actor disappeared.
+      final response = await sendCommand('list');
+      _players = parsePlayerList(response);
+      _notify();
+      if (_players.any((p) => p.name == playerName)) {
+        throw const RconCommandException(
+          'Bot is still present. Its owner must be online for the assistant mod to dismiss it.',
+        );
+      }
+      return 'Dismissed $playerName';
+    }
+    if (lockoutMinutes < 0 || lockoutMinutes > 1440) {
+      throw const RconCommandException(
+        'Use a lockout between 0 and 1440 minutes.',
+      );
+    }
+    if (lockoutMinutes > 0) {
+      return _timerAction(
+        (timers) => timers.kick(playerName, reason, lockoutMinutes),
+      );
+    }
+    final response = await sendCommand('kick $playerName ${reason.trim()}');
+    await refreshPlayers();
+    return response;
   }
 
-  Future<String> healPlayer(String playerName) async {
-    // Instant health effect
-    return sendCommand('effect give $playerName minecraft:instant_health 1 10');
-  }
-
-  Future<String> feedPlayer(String playerName) async {
-    // Saturation effect for instant food
-    return sendCommand('effect give $playerName minecraft:saturation 1 20');
-  }
-
-  Future<String> clearEffects(String playerName) async {
-    return sendCommand('effect clear $playerName');
-  }
-
-  Future<String> setTime(String time) async {
-    // time can be: day, night, noon, midnight, or a number
-    return sendCommand('time set $time');
-  }
-
-  Future<String> setWeather(String weather) async {
-    // weather can be: clear, rain, thunder
-    return sendCommand('weather $weather');
-  }
-
-  Future<String> giveItem(String playerName, String item, int amount) async {
-    return sendCommand('give $playerName $item $amount');
-  }
-
-  Future<String> kickPlayer(String playerName, String reason) async {
-    return sendCommand('kick $playerName $reason');
-  }
-
-  Future<String> messagePlayer(String playerName, String message) async {
-    return sendCommand('tell $playerName $message');
-  }
-
-  Future<String> broadcastMessage(String message) async {
-    return sendCommand('say $message');
-  }
-
-  Future<String> setSpawnPoint(String playerName) async {
-    return sendCommand('spawnpoint $playerName ~ ~ ~');
-  }
-
-  Future<String> killPlayer(String playerName) async {
-    return sendCommand('kill $playerName');
-  }
-
-  Future<String> clearInventory(String playerName) async {
-    return sendCommand('clear $playerName');
-  }
+  Future<String> messagePlayer(String playerName, String message) =>
+      sendCommand('tell ${_playerArgument(playerName)} $message');
+  Future<String> setSpawnPoint(String playerName) => sendCommand(
+    'execute at ${_playerArgument(playerName)} run spawnpoint ${_playerArgument(playerName)} ~ ~ ~',
+  );
+  Future<String> killPlayer(String playerName) =>
+      sendCommand('kill ${_playerArgument(playerName)}');
+  Future<String> clearInventory(String playerName) =>
+      sendCommand('clear ${_playerArgument(playerName)}');
 
   Future<List<Map<String, dynamic>>> getPlayerInventory(
     String playerName,
-  ) async {
-    final response = await sendCommand('data get entity $playerName Inventory');
-    return _parseInventoryResponse(response);
-  }
+  ) async => InventoryParser.parse(
+    await sendCommand(
+      'data get entity ${_playerArgument(playerName)} Inventory',
+    ),
+  );
 
-  List<Map<String, dynamic>> _parseInventoryResponse(String response) {
-    // Response format: "PlayerName has the following entity data: [{Slot: 0b, id: "minecraft:stone", count: 64b}, ...]"
-    try {
-      final startIndex = response.indexOf('[');
-      if (startIndex == -1) return [];
+  static String inventorySlot(int slot) => switch (slot) {
+    >= 0 && <= 35 => 'container.$slot',
+    100 => 'armor.feet',
+    101 => 'armor.legs',
+    102 => 'armor.chest',
+    103 => 'armor.head',
+    -106 => 'weapon.offhand',
+    _ => throw const RconCommandException('Unsupported inventory slot.'),
+  };
 
-      String snbt = response.substring(startIndex);
-
-      // Basic SNBT to JSON conversion for simple inventory items
-      // 1. Remove type suffixes: 0b, 10s, 100L, 1.0f, 1.0d
-      snbt = snbt.replaceAllMapped(RegExp(r'(\d+)[bsL]'), (m) => m.group(1)!);
-      snbt = snbt.replaceAllMapped(
-        RegExp(r'(\d+\.\d+)[fd]'),
-        (m) => m.group(1)!,
+  void _validateItem(String item, int amount) {
+    if (!RegExp(r'^(?:[a-z0-9_.-]+:)?[a-z0-9_./-]+$').hasMatch(item)) {
+      throw const RconCommandException(
+        'Enter a valid item ID, such as minecraft:stone.',
       );
-
-      // 2. Ensure keys are quoted
-      snbt = snbt.replaceAllMapped(
-        RegExp(r'([{,]\s*)([a-zA-Z0-9_]+)\s*:'),
-        (m) => '${m.group(1)}"${m.group(2)}":',
-      );
-
-      final decoded = jsonDecode(snbt);
-      if (decoded is List) {
-        return List<Map<String, dynamic>>.from(decoded);
-      }
-    } catch (e) {
-      developer.log('Error parsing inventory response', error: e);
     }
-    return [];
+    if (amount < 1 || amount > 2304) {
+      throw const RconCommandException('Use an item count between 1 and 2304.');
+    }
   }
 
-  Future<String> removeItem(String playerName, int slot) async {
-    // In modern Minecraft, we can use /item replace
-    return sendCommand(
-      'item replace entity $playerName container.$slot with minecraft:air',
-    );
-  }
-
+  Future<String> removeItem(String playerName, int slot) => sendCommand(
+    'item replace entity ${_playerArgument(playerName)} ${inventorySlot(slot)} with minecraft:air',
+  );
   Future<String> setItem(
     String playerName,
     int slot,
     String itemId,
     int amount,
-  ) async {
+  ) {
+    _validateItem(itemId, amount);
     return sendCommand(
-      'item replace entity $playerName container.$slot with $itemId $amount',
+      'item replace entity ${_playerArgument(playerName)} ${inventorySlot(slot)} with $itemId $amount',
     );
   }
 
-  Future<String> giveXp(String playerName, int amount) async {
-    return sendCommand('xp add $playerName $amount points');
-  }
-
-  Future<String> setXpLevel(String playerName, int level) async {
-    return sendCommand('xp set $playerName $level levels');
-  }
+  Future<String> giveXp(String playerName, int amount) =>
+      sendCommand('xp add ${_playerArgument(playerName)} $amount points');
+  Future<String> setXpLevel(String playerName, int level) =>
+      sendCommand('xp set ${_playerArgument(playerName)} $level levels');
 
   @override
   void dispose() {
+    _disposed = true;
+    _generation++;
+    _monitor?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    _connectionSubscription.cancel();
+    _timers?.suspend();
+    _noticeController.close();
     _client.dispose();
     super.dispose();
   }
